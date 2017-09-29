@@ -1,0 +1,324 @@
+#!/usr/bin/perl
+#
+# Copy an entire btrfs filesystem to another place. Include all subvolumes.
+# Starting with the algorithm outlined here: https://superuser.com/a/1073943
+# and making whatever changes I find I need.
+# I am writing this only to solve a here-and-now problem of mine, and make
+# no warranties of any kind that it will solve any other problem.
+#
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use UBOS::Logging;
+use UBOS::Utils;
+
+my $verbose      = 0;
+my $logConfig    = undef;
+my $debug        = 0;
+my $rootSnapName = undef;
+my $editFstab    = 0;
+
+my $parseOk = GetOptions(
+        'verbose+'             => \$verbose,
+        'logConfig=s'          => \$logConfig,
+        'debug'                => \$debug,
+        'root-snapshot-name=s' => \$rootSnapName,
+        'edit-fstab'           => \$editFstab );
+
+if( !$parseOk || @ARGV != 2 ) {
+     synopsisQuit();
+}
+UBOS::Logging::initialize( 'btrfs-copy-filesystem', undef, $verbose, $logConfig, $debug );
+
+unless( $< == 0 ) {
+    fatal( 'This command must be run as root' );
+}
+
+my $sourceRootSnapName;
+my $destRootSnapName;
+if( $rootSnapName ) {
+    unless( $rootSnapName =~ m!^/! ) {
+        $rootSnapName = "/$rootSnapName";
+    }
+    $sourceRootSnapName = $rootSnapName;
+    $destRootSnapName   = $rootSnapName;
+} else {
+    my ( $sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst ) = gmtime( time() );
+    my $ts = sprintf( '%.4d%.2d%.2d-%.2d%.2d%.2d', ($year+1900), ( $mon+1 ), $mday, $hour, $min, $sec );
+    $sourceRootSnapName = "/export-$ts";
+    $destRootSnapName   = "/import-$ts";
+}
+
+my( $source, $dest ) = @ARGV;
+my $out;
+
+if( $source eq $dest ) {
+    fatal( 'Source and destination are the same' );
+}
+
+trace( 'Copying from', $source, 'to', $dest );
+
+# Testing that both are root btrfs vols
+
+if( myexec( "lsblk --json --output-all --paths", undef, \$out )) {
+    fatal( 'lsblk failed', $@ );
+}
+my $lsblk = UBOS::Utils::readJsonFromString( $out );
+my $foundSource = 0;
+my $foundDest   = 0;
+foreach my $disk ( @{$lsblk->{blockdevices}} ) {
+    if( defined( $disk->{mountpoint} )) {
+        $foundSource |= _checkFs( $disk, $source );
+        $foundDest   |= _checkFs( $disk, $dest );
+    } elsif( defined( $disk->{children} )) {
+        foreach my $child ( @{$disk->{children}} ) {
+            if( defined( $child->{mountpoint} )) {
+                $foundSource |= _checkFs( $child, $source );
+                $foundDest   |= _checkFs( $child, $dest );
+            }
+        }
+    }
+}
+unless( $foundSource ) {
+    fatal( 'Not a btrfs filesystem:', $source );
+}
+unless( $foundDest ) {
+    fatal( 'Not a btrfs filesystem:', $dest );
+}
+
+# Make sure both source and dest have mounted the root subvol
+if( myexec( 'mount', undef, \$out )) {
+    fatal( 'mount command failed' );
+}
+my $sourceDevice;
+my $sourceSubvolId;
+my $sourceSubvolPath;
+my $destDevice;
+my $destSubvolId;
+my $destSubvolPath;
+foreach my $line ( split /\n/, $out ) {
+    if( $line =~ m!^(/dev/[a-z0-9]+)\s+on\s+(\S+)\s+type.*\(([^\)]+)\)$! ) {
+        my( $device, $path, $options ) = ( $1, $2, $3 );
+        my $subvolId   = 5;
+        my $subvolPath = '/';
+        if( $options =~ m!subvolid=(\d+),subvol=([^,\)]+)! ) {
+            $subvolId   = $1;
+            $subvolPath = $2;
+        }
+
+        if( $path eq $source ) {
+            $sourceDevice     = $device;
+            $sourceSubvolId   = $subvolId;
+            $sourceSubvolPath = $subvolPath;
+        } elsif( $path eq $dest ) {
+            $destDevice     = $device;
+            $destSubvolId   = $subvolId;
+            $destSubvolPath = $subvolPath;
+        }
+    }
+}
+
+# Possibly remount so we can see the entire drive
+if( $sourceSubvolPath ne '/' ) {
+    info( "Source $source has subvolume $sourceSubvolPath mounted, remounting root subvolume" );
+    _remountToSubvol( $sourceDevice, $source, '/' );
+}
+if( $destSubvolPath ne '/' ) {
+    info( "Destination $dest has subvolume $destSubvolPath mounted, remounting root subvolume" );
+    _remountToSubvol( $destDevice, $dest, '/' );
+}
+
+# Create a snapshot of the source's root subvol
+
+info( "Creating temporary root volume snapshot $source$sourceRootSnapName" );
+
+if( myexec( "echo btrfs subvolume shapshot -r '$source' '$source$sourceRootSnapName'" )) {
+    warning( 'Failed to create btrfs snapshot of root subvolume:', $source );
+}
+
+# Determining the list of source subvols
+
+my( $sourceSubvolSequence, $sourceSubvols, $sourceUuids ) = _determineSubvols( $source );
+
+info( "Found " . ( 0 + @$sourceSubvolSequence ) . " subvolumes. Temporarily setting them all to read-only." );
+
+# Make all subvolumes read-only
+my $rememberRo = [];
+foreach my $path ( @$sourceSubvolSequence ) {
+    my $doSet = 0;
+    if( myexec( "btrfs property get -ts '$source/$path' ro", undef, \$out )) {
+        warning( "btrfs property set failed on", "$source/$path" );
+        $doSet = 1;
+    } elsif( $out =~ m!false! ) { # more stuff in the response
+        $doSet = 1;
+        push @$rememberRo, $path;
+    }
+    if( $doSet ) {
+        if( myexec( "echo btrfs property set -ts '$source/$path' ro true" )) {
+            warning( "btrfs property set failed on", "$source/$path" );
+        }
+    }
+}
+
+# Now send child volumes
+foreach my $path ( @$sourceSubvolSequence ) {
+    info( "Sending $source/$path" );
+    if(    $sourceSubvols->{$path}->{parentUuid} eq '-' 
+        || !exists( $sourceUuids->{$sourceSubvols->{$path}->{parentUuid}} ))
+    {
+        if( myexec( "echo btrfs send '$source/$path' PIPE btrfs receive '$dest/$path'" )) {
+            warning( "btrfs send failed:", $source, $dest );
+        }
+    } else {
+        my $parentPath = $sourceUuids->{$sourceSubvols->{$path}->{parentUuid}};
+        if( myexec( "echo btrfs send -p '$source/$parentPath' -c '$source/$parentPath' '$source/$path' PIPE btrfs receive '$dest/$path'" )) {
+            warning( "btrfs send failed:", $source, $dest );
+        }
+    }
+}
+
+info( "Resetting read-only to previous value" );
+
+# Reset read-only/read-write
+foreach my $path ( @$rememberRo ) {
+    if( myexec( "echo btrfs property set -ts '$source/$path' ro false" )) {
+        warning( "btrfs property set failed on", "$source/$path" );
+    }
+}
+
+info( "Removing source root snapshot $source$sourceRootSnapName" );
+
+# Remove the source root snapshot name
+if( myexec( "echo btrfs subvolume delete '$source$sourceRootSnapName'" )) {
+    warning( "btrfs subvolume delete failed:", "$source$sourceRootSnapName" );
+}
+# Rename the destination snapshot
+if( $sourceRootSnapName ne $destRootSnapName ) {
+    if( myexec( "echo mv '$dest$sourceRootSnapName' '$dest$destRootSnapName'" )) {
+        warning( "Failed to rename destination snapshot '$dest$sourceRootSnapName' '$dest$destRootSnapName'" );
+    }
+}
+
+# Remount
+if( $sourceSubvolPath ne '/' ) {
+    info( "Remounting source subvolume $sourceSubvolPath" );
+    _remountToSubvol( $sourceDevice, $source, $sourceSubvolPath );
+}
+info( "Mounting copied root subvolume instead of old destination subvolume $destSubvolPath" );
+_remountToSubvol( $destDevice, $dest, $destSubvolPath );
+
+if( $editFstab ) {
+    # Determine id of the dest subvol that's the copy of the source root snapshot
+    if( myexec( "echo btrfs subvol show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
+        my $newDestSubvolId = $1;
+        my $fstab = UBOS::Utils::slurpFile( '/etc/fstab' );
+        if( $fstab ) {
+            my $newFstab;
+            foreach my $line ( split /\n/, $fstab ) {
+                my $beforeHash;
+                my $afterHash;
+                if( $line =~ m!^([^#]+)(#.*)$! ) {
+                    ( $beforeHash, $afterHash ) = ( $1, $2 );
+                } else {
+                    ( $beforeHash, $afterHash ) = ( $line, '' );
+                }
+# /dev/sdb            	/build    	btrfs     	rw,relatime,space_cache,subvolid=5,subvol=/	0 0
+                if( $beforeHash =~ m!^(\S+\s+)$dest(\s+\S+\s+)(\S+)(\s+\S+\s+\S+.*)$! ) {
+                    my( $beforeDest, $beforeOptions, $options, $afterOptions ) = ( $1, $2, $3, $4 );
+		    unless( $options =~ s!subvolid=\d+!$newDestSubvolId! ) {
+                        $options .= ',subvolid=' . $newDestSubvolId;
+                    }
+		    unless( $options =~ s!subvol=\S+!$destSubvolPath! ) {
+                        $options .= ',subvol=' . $destSubvolPath;
+                    }
+                    $newFstab .= "$beforeDest$dest$beforeOptions$options$afterOptions$afterHash";
+                } else {
+                    $newFstab .= "$beforeHash$afterHash";
+                }
+            }
+
+print "NEW FSTAB:\n" . $newFstab;
+#            unless( UBOS::Utils::saveFile( '/etc/fstab', $newFstab )) {
+#                error( 'Cannot save updated /etc/fstab' );
+#            }
+        } else {
+            error( 'Failed to read /etc/fstab, cannot edit' );
+        }
+    } else {
+        error( 'Cannot determine subvolid of destination copy of the source root. Not editing /etc/fstab' );
+    }
+}
+
+info( "... and we are done." );
+
+###
+sub _determineSubvols {
+    my $dir = shift;
+
+    my $out;
+    if( myexec( "btrfs subvolume list -qu --sort ogen '$dir'", undef, \$out )) {
+       fatal( 'btrfs subvolume list failed:', $dir );
+    }
+
+    my $sequence = [];
+    my $data     = {};
+    my $uuids    = {};
+
+    # ID 7240 gen 79377 top level 5 parent_uuid - uuid d31414dd-4a42-1b43-aafe-a72d6bffada7 path x86_64/workarea/20170601/repository-dev/x86_64/uncompressed-images/ubos_dev_container-pc_20170601-032222.tardir
+    foreach my $line ( split( '\n', $out )) {
+        if( $line =~ m!^ID\s+(\d+)\s+gen\s+(\d+)\s+(\S+)\s+level\s+(\d+)\s+parent_uuid\s+(\S+)\s+uuid\s+([-0-9a-f]+)\s+path\s+(.+)$! ) {
+            my( $id, $gen, $top, $level, $parentUuid, $uuid, $path ) = ( $1, $2, $3, $4, $5, $6, $7 );
+            $data->{$path} = {
+                id => $id,
+                gen => $gen,
+                top => $top,
+                level => $level,
+                parentUuid => $parentUuid,
+                uuid => $uuid
+            };
+            push @$sequence, $path;
+            $uuids->{$uuid} = $path;
+        }
+    }
+
+
+    return ( $sequence, $data, $uuids );
+}
+
+####
+sub _checkFs {
+    my $json       = shift;
+    my $mountpoint = shift;
+
+    if( $mountpoint eq $json->{mountpoint} ) {
+        unless( 'btrfs' eq $json->{fstype} ) {
+            fatal( 'Not a btrfs filesystem:', $mountpoint );
+        }
+    }
+}
+
+###
+sub _remountToSubvol {
+    my $device     = shift;
+    my $path       = shift;
+    my $subvolPath = shift;
+
+    if( myexec( "echo umount '$device'" )) {
+        warning( 'Cannot unmount', $device );
+    }
+    if( myexec( "echo mount '$device' '$path' -o 'subvol=$subvolPath'" )) {
+        warning( 'Cannot mount', $device, $path, $subvolPath );
+    }
+}
+
+####
+sub synopsisQuit {
+    print "$0 [--verbose][--logConfig <config>] <src> <dest>\n";
+
+    exit 0;
+}
+
+1;
+
