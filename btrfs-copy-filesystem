@@ -6,6 +6,20 @@
 # I am writing this only to solve a here-and-now problem of mine, and make
 # no warranties of any kind that it will solve any other problem.
 #
+# Here's the plan:
+# 1. check that arguments are valid
+# 2. if the source or dest volumes are subvols, remount with root subvol so
+#    we get all the data
+# 3. make a read-only snapshot of the source root subvol, and send it over
+# 4. delete the just created snapshot of the source root subvol
+# 5. possibly rename and then mount the just received snapshot of the root
+#    subvol on the destination
+# 6. for all subvols on source other than the root subvol:
+#      mark them as read-only
+#      send them over
+#      mark them as read-write again if they had previously been
+# 7. Remount the source into its original state
+# 8. Optionally, edit /etc/fstab so the new root subvol gets mounted
 
 use warnings;
 use strict;
@@ -134,9 +148,36 @@ if( $destSubvolPath ne '/' ) {
 
 info( "Creating temporary root volume snapshot $source$sourceRootSnapName" );
 
-if( myexec( "echo btrfs subvolume shapshot -r '$source' '$source$sourceRootSnapName'" )) {
+if( myexec( "echo btrfs subvolume snapshot -r '$source' '$source$sourceRootSnapName'" )) {
     warning( 'Failed to create btrfs snapshot of root subvolume:', $source );
 }
+
+info( "Sending root volume snapshot $source$sourceRootSnapName" );
+if( myexec( "echo btrfs send '$source$sourceRootSnapName' PIPE btrfs receive '$dest'" )) {
+    warning( "btrfs send failed:", $source, $dest );
+}
+
+info( "Removing source root snapshot $source$sourceRootSnapName" );
+
+# Remove the source root snapshot name
+if( myexec( "echo btrfs subvolume delete '$source$sourceRootSnapName'" )) {
+    warning( "btrfs subvolume delete failed:", "$source$sourceRootSnapName" );
+}
+
+# Rename the destination snapshot and set it read-write
+if( $sourceRootSnapName ne $destRootSnapName ) {
+    if( myexec( "echo mv '$dest$sourceRootSnapName' '$dest$destRootSnapName'" )) {
+        warning( "Failed to rename destination snapshot '$dest$sourceRootSnapName' '$dest$destRootSnapName'" );
+    }
+}
+
+if( myexec( "echo btrfs property set -ts '$dest$destRootSnapName' ro false" )) {
+    warning( "Failed to make destination read-write again: '$dest$destRootSnapName'" );
+}
+
+# Remount destination
+info( "Mounting copied root subvolume instead of old destination subvolume $destSubvolPath" );
+_remountToSubvol( $destDevice, $dest, $destSubvolPath );
 
 # Determining the list of source subvols
 
@@ -147,14 +188,14 @@ info( "Found " . ( 0 + @$sourceSubvolSequence ) . " subvolumes. Temporarily sett
 # Make all subvolumes read-only
 my $rememberRo = [];
 foreach my $path ( @$sourceSubvolSequence ) {
-    my $doSet = 0;
+    my $doSet = 1;
     if( myexec( "btrfs property get -ts '$source/$path' ro", undef, \$out )) {
-        warning( "btrfs property set failed on", "$source/$path" );
-        $doSet = 1;
-    } elsif( $out =~ m!false! ) { # more stuff in the response
-        $doSet = 1;
+        warning( "btrfs property get failed on", "$source/$path" );
+    } elsif( $out =~ m!true! ) { # more stuff in the response
         push @$rememberRo, $path;
-    }
+        $doSet = 0;
+    } 
+
     if( $doSet ) {
         if( myexec( "echo btrfs property set -ts '$source/$path' ro true" )) {
             warning( "btrfs property set failed on", "$source/$path" );
@@ -168,50 +209,38 @@ foreach my $path ( @$sourceSubvolSequence ) {
     if(    $sourceSubvols->{$path}->{parentUuid} eq '-' 
         || !exists( $sourceUuids->{$sourceSubvols->{$path}->{parentUuid}} ))
     {
-        if( myexec( "echo btrfs send '$source/$path' PIPE btrfs receive '$dest/$path'" )) {
-            warning( "btrfs send failed:", $source, $dest );
+        if( myexec( "echo btrfs send '$source/$path' PIPE btrfs receive \$(dirname '$dest$destRootSnapName/$path')" )) {
+            warning( "btrfs send (1) failed:", "$source/$path", "$dest$destRootSnapName/$path" );
         }
     } else {
         my $parentPath = $sourceUuids->{$sourceSubvols->{$path}->{parentUuid}};
-        if( myexec( "echo btrfs send -p '$source/$parentPath' -c '$source/$parentPath' '$source/$path' PIPE btrfs receive '$dest/$path'" )) {
-            warning( "btrfs send failed:", $source, $dest );
+        if( myexec( "echo btrfs send -p '$source/$parentPath' -c '$source/$parentPath' '$source/$path' PIPE btrfs receive \$(dirname '$dest$destRootSnapName/$path')" )) {
+            warning( "btrfs send (2) failed:", "$source/$path", "$dest$destRootSnapName/$path" );
         }
+    }
+    # set to read-write, otherwise others may not be received
+    if( myexec( "echo btrfs property set -ts '$dest$destRootSnapName/$path' ro false" )) {
+        warning( "could not set to read-write:", "$dest$destRootSnapName/$path" );
     }
 }
 
 info( "Resetting read-only to previous value" );
 
-# Reset read-only/read-write
 foreach my $path ( @$rememberRo ) {
-    if( myexec( "echo btrfs property set -ts '$source/$path' ro false" )) {
+    if( myexec( "echo btrfs property set -ts '$source/$path' ro true" )) {
         warning( "btrfs property set failed on", "$source/$path" );
     }
 }
 
-info( "Removing source root snapshot $source$sourceRootSnapName" );
-
-# Remove the source root snapshot name
-if( myexec( "echo btrfs subvolume delete '$source$sourceRootSnapName'" )) {
-    warning( "btrfs subvolume delete failed:", "$source$sourceRootSnapName" );
-}
-# Rename the destination snapshot
-if( $sourceRootSnapName ne $destRootSnapName ) {
-    if( myexec( "echo mv '$dest$sourceRootSnapName' '$dest$destRootSnapName'" )) {
-        warning( "Failed to rename destination snapshot '$dest$sourceRootSnapName' '$dest$destRootSnapName'" );
-    }
-}
-
-# Remount
+# Remount source
 if( $sourceSubvolPath ne '/' ) {
     info( "Remounting source subvolume $sourceSubvolPath" );
     _remountToSubvol( $sourceDevice, $source, $sourceSubvolPath );
 }
-info( "Mounting copied root subvolume instead of old destination subvolume $destSubvolPath" );
-_remountToSubvol( $destDevice, $dest, $destSubvolPath );
 
 if( $editFstab ) {
     # Determine id of the dest subvol that's the copy of the source root snapshot
-    if( myexec( "echo btrfs subvol show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
+    if( myexec( "btrfs subvol show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
         my $newDestSubvolId = $1;
         my $fstab = UBOS::Utils::slurpFile( '/etc/fstab' );
         if( $fstab ) {
