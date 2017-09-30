@@ -68,6 +68,15 @@ if( $rootSnapName ) {
 my( $source, $dest ) = @ARGV;
 my $out;
 
+unless( $source =~ m!^/! ) {
+    fatal( 'Source must be an absolute path name, is:', $source );
+}
+unless( $dest =~ m!^/! ) {
+    fatal( 'Destination must be an absolute path name, is:', $dest );
+}
+$source =~ s!/+$!!;
+$dest   =~ s!/+$!!;
+
 if( $source eq $dest ) {
     fatal( 'Source and destination are the same' );
 }
@@ -192,11 +201,11 @@ foreach my $path ( @$sourceSubvolSequence ) {
     if( myexec( "btrfs property get -ts '$source/$path' ro", undef, \$out )) {
         warning( "btrfs property get failed on", "$source/$path" );
     } elsif( $out =~ m!true! ) { # more stuff in the response
-        push @$rememberRo, $path;
         $doSet = 0;
     } 
 
     if( $doSet ) {
+        push @$rememberRo, $path;
         if( myexec( "echo btrfs property set -ts '$source/$path' ro true" )) {
             warning( "btrfs property set failed on", "$source/$path" );
         }
@@ -240,8 +249,8 @@ if( $sourceSubvolPath ne '/' ) {
 
 if( $editFstab ) {
     # Determine id of the dest subvol that's the copy of the source root snapshot
-    if( myexec( "btrfs subvol show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
-        my $newDestSubvolId = $1;
+    if( 1 || myexec( "btrfs subvol show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
+        my $newDestSubvolId = 'XXYY'; # $1;
         my $fstab = UBOS::Utils::slurpFile( '/etc/fstab' );
         if( $fstab ) {
             my $newFstab;
@@ -256,15 +265,15 @@ if( $editFstab ) {
 # /dev/sdb            	/build    	btrfs     	rw,relatime,space_cache,subvolid=5,subvol=/	0 0
                 if( $beforeHash =~ m!^(\S+\s+)$dest(\s+\S+\s+)(\S+)(\s+\S+\s+\S+.*)$! ) {
                     my( $beforeDest, $beforeOptions, $options, $afterOptions ) = ( $1, $2, $3, $4 );
-		    unless( $options =~ s!subvolid=\d+!$newDestSubvolId! ) {
+		    unless( $options =~ s!subvolid=\d+!subvolid=$newDestSubvolId! ) {
                         $options .= ',subvolid=' . $newDestSubvolId;
                     }
-		    unless( $options =~ s!subvol=\S+!$destSubvolPath! ) {
+		    unless( $options =~ s!subvol=\S+!subvol=$destSubvolPath! ) {
                         $options .= ',subvol=' . $destSubvolPath;
                     }
-                    $newFstab .= "$beforeDest$dest$beforeOptions$options$afterOptions$afterHash";
+                    $newFstab .= "$beforeDest$dest$beforeOptions$options$afterOptions$afterHash\n";
                 } else {
-                    $newFstab .= "$beforeHash$afterHash";
+                    $newFstab .= "$beforeHash$afterHash\n";
                 }
             }
 
