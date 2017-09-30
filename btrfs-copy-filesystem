@@ -8,18 +8,18 @@
 #
 # Here's the plan:
 # 1. check that arguments are valid
-# 2. if the source or dest volumes are subvols, remount with root subvol so
+# 2. if the source or dest volumes are subvols, remount with root subvolume so
 #    we get all the data
 # 3. make a read-only snapshot of the source root subvol, and send it over
 # 4. delete the just created snapshot of the source root subvol
 # 5. possibly rename and then mount the just received snapshot of the root
-#    subvol on the destination
+#    subvolume on the destination
 # 6. for all subvols on source other than the root subvol:
 #      mark them as read-only
 #      send them over
 #      mark them as read-write again if they had previously been
 # 7. Remount the source into its original state
-# 8. Optionally, edit /etc/fstab so the new root subvol gets mounted
+# 8. Optionally, edit /etc/fstab so the new root subvolume gets mounted
 
 use warnings;
 use strict;
@@ -31,6 +31,7 @@ use UBOS::Utils;
 my $verbose      = 0;
 my $logConfig    = undef;
 my $debug        = 0;
+my $dryRun       = 0;
 my $rootSnapName = undef;
 my $editFstab    = 0;
 
@@ -38,6 +39,7 @@ my $parseOk = GetOptions(
         'verbose+'             => \$verbose,
         'logConfig=s'          => \$logConfig,
         'debug'                => \$debug,
+        'n|dry-run'            => \$dryRun,
         'root-snapshot-name=s' => \$rootSnapName,
         'edit-fstab'           => \$editFstab );
 
@@ -157,30 +159,30 @@ if( $destSubvolPath ne '/' ) {
 
 info( "Creating temporary root volume snapshot $source$sourceRootSnapName" );
 
-if( myexec( "echo btrfs subvolume snapshot -r '$source' '$source$sourceRootSnapName'" )) {
+if( _maybeExec( "btrfs subvolume snapshot -r '$source' '$source$sourceRootSnapName'" )) {
     warning( 'Failed to create btrfs snapshot of root subvolume:', $source );
 }
 
 info( "Sending root volume snapshot $source$sourceRootSnapName" );
-if( myexec( "echo btrfs send '$source$sourceRootSnapName' PIPE btrfs receive '$dest'" )) {
+if( _maybeExec( "btrfs send '$source$sourceRootSnapName' | btrfs receive '$dest'" )) {
     warning( "btrfs send failed:", $source, $dest );
 }
 
 info( "Removing source root snapshot $source$sourceRootSnapName" );
 
 # Remove the source root snapshot name
-if( myexec( "echo btrfs subvolume delete '$source$sourceRootSnapName'" )) {
+if( _maybeExec( "btrfs subvolume delete '$source$sourceRootSnapName'" )) {
     warning( "btrfs subvolume delete failed:", "$source$sourceRootSnapName" );
 }
 
 # Rename the destination snapshot and set it read-write
 if( $sourceRootSnapName ne $destRootSnapName ) {
-    if( myexec( "echo mv '$dest$sourceRootSnapName' '$dest$destRootSnapName'" )) {
+    if( _maybeExec( "mv '$dest$sourceRootSnapName' '$dest$destRootSnapName'" )) {
         warning( "Failed to rename destination snapshot '$dest$sourceRootSnapName' '$dest$destRootSnapName'" );
     }
 }
 
-if( myexec( "echo btrfs property set -ts '$dest$destRootSnapName' ro false" )) {
+if( _maybeExec( "btrfs property set -ts '$dest$destRootSnapName' ro false" )) {
     warning( "Failed to make destination read-write again: '$dest$destRootSnapName'" );
 }
 
@@ -206,7 +208,7 @@ foreach my $path ( @$sourceSubvolSequence ) {
 
     if( $doSet ) {
         push @$rememberRo, $path;
-        if( myexec( "echo btrfs property set -ts '$source/$path' ro true" )) {
+        if( _maybeExec( "btrfs property set -ts '$source/$path' ro true" )) {
             warning( "btrfs property set failed on", "$source/$path" );
         }
     }
@@ -218,17 +220,17 @@ foreach my $path ( @$sourceSubvolSequence ) {
     if(    $sourceSubvols->{$path}->{parentUuid} eq '-' 
         || !exists( $sourceUuids->{$sourceSubvols->{$path}->{parentUuid}} ))
     {
-        if( myexec( "echo btrfs send '$source/$path' PIPE btrfs receive \$(dirname '$dest$destRootSnapName/$path')" )) {
+        if( _maybeExec( "btrfs send '$source/$path' | btrfs receive \$(dirname '$dest$destRootSnapName/$path')" )) {
             warning( "btrfs send (1) failed:", "$source/$path", "$dest$destRootSnapName/$path" );
         }
     } else {
         my $parentPath = $sourceUuids->{$sourceSubvols->{$path}->{parentUuid}};
-        if( myexec( "echo btrfs send -p '$source/$parentPath' -c '$source/$parentPath' '$source/$path' PIPE btrfs receive \$(dirname '$dest$destRootSnapName/$path')" )) {
+        if( _maybeExec( "btrfs send -p '$source/$parentPath' -c '$source/$parentPath' '$source/$path' | btrfs receive \$(dirname '$dest$destRootSnapName/$path')" )) {
             warning( "btrfs send (2) failed:", "$source/$path", "$dest$destRootSnapName/$path" );
         }
     }
     # set to read-write, otherwise others may not be received
-    if( myexec( "echo btrfs property set -ts '$dest$destRootSnapName/$path' ro false" )) {
+    if( _maybeExec( "btrfs property set -ts '$dest$destRootSnapName/$path' ro false" )) {
         warning( "could not set to read-write:", "$dest$destRootSnapName/$path" );
     }
 }
@@ -236,7 +238,7 @@ foreach my $path ( @$sourceSubvolSequence ) {
 info( "Resetting read-only to previous value" );
 
 foreach my $path ( @$rememberRo ) {
-    if( myexec( "echo btrfs property set -ts '$source/$path' ro true" )) {
+    if( _maybeExec( "btrfs property set -ts '$source/$path' ro true" )) {
         warning( "btrfs property set failed on", "$source/$path" );
     }
 }
@@ -248,8 +250,8 @@ if( $sourceSubvolPath ne '/' ) {
 }
 
 if( $editFstab ) {
-    # Determine id of the dest subvol that's the copy of the source root snapshot
-    if( 1 || myexec( "btrfs subvol show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
+    # Determine id of the dest subvolume that's the copy of the source root snapshot
+    if( myexec( "btrfs subvolume show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
         my $newDestSubvolId = 'XXYY'; # $1;
         my $fstab = UBOS::Utils::slurpFile( '/etc/fstab' );
         if( $fstab ) {
@@ -343,17 +345,30 @@ sub _remountToSubvol {
     my $path       = shift;
     my $subvolPath = shift;
 
-    if( myexec( "echo umount '$device'" )) {
+    if( _maybeExec( "umount '$device'" )) {
         warning( 'Cannot unmount', $device );
     }
-    if( myexec( "echo mount '$device' '$path' -o 'subvol=$subvolPath'" )) {
+    if( _maybeExec( "mount '$device' '$path' -o 'subvol=$subvolPath'" )) {
         warning( 'Cannot mount', $device, $path, $subvolPath );
     }
 }
 
 ####
+sub _maybeExec {
+    my @args = @_;
+
+    my $ret = 0;
+    if( $dryRun ) { 
+        print join( ' ', @args ) . "\n";
+    } else {
+        $ret = myexec( @args );
+    }
+    return $ret;
+}
+
+####
 sub synopsisQuit {
-    print "$0 [--verbose][--logConfig <config>] <src> <dest>\n";
+    print "$0 [--verbose][--logConfig <config>][-n|--dry-run] <src> <dest>\n";
 
     exit 0;
 }
