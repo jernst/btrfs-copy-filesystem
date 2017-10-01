@@ -251,8 +251,8 @@ if( $sourceSubvolPath ne '/' ) {
 
 if( $editFstab ) {
     # Determine id of the dest subvolume that's the copy of the source root snapshot
-    if( myexec( "btrfs subvolume show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
-        my $newDestSubvolId = 'XXYY'; # $1;
+    if( ~myexec( "btrfs subvolume show '$dest/$destSubvolPath'", undef, \$out ) && $out =~ m!Subvolume ID:\s*(\d+)! ) {
+        my $newDestSubvolId = $1;
         my $fstab = UBOS::Utils::slurpFile( '/etc/fstab' );
         if( $fstab ) {
             my $newFstab;
@@ -279,10 +279,14 @@ if( $editFstab ) {
                 }
             }
 
-print "NEW FSTAB:\n" . $newFstab;
-#            unless( UBOS::Utils::saveFile( '/etc/fstab', $newFstab )) {
-#                error( 'Cannot save updated /etc/fstab' );
-#            }
+            unless( UBOS::Utils::saveFile( '/etc/fstab', $newFstab )) {
+                error( 'Cannot save updated /etc/fstab' );
+            }
+
+            info( "Remounting" );
+
+            _remountToSubvol( $destDevice, $dest, $destSubvolPath );
+
         } else {
             error( 'Failed to read /etc/fstab, cannot edit' );
         }
